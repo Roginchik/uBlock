@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    uBlock Origin - a browser extension to block requests.
-    Copyright (C) 2015-2017 Raymond Hill
+    uBlock Origin - a comprehensive, efficient content blocker
+    Copyright (C) 2015-present Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,10 +19,6 @@
     Home: https://github.com/gorhill/uBlock
 */
 
-/* global HTMLDocument */
-
-'use strict';
-
 /******************************************************************************/
 
 // Injected into specific web pages, those which have been pre-selected
@@ -30,96 +26,84 @@
 
 /******************************************************************************/
 
-(function() {
+(( ) => {
+// >>>>> start of local scope
 
 /******************************************************************************/
 
 // https://github.com/chrisaljoudi/uBlock/issues/464
-if ( document instanceof HTMLDocument === false ) {
-    //console.debug('subscriber.js > not a HTLMDocument');
-    return;
-}
+if ( document instanceof HTMLDocument === false ) { return; }
 
-// Because in case
-if ( typeof vAPI !== 'object' ) {
-    //console.debug('subscriber.js > vAPI not found');
-    return;
-}
+// Maybe uBO has gone away meanwhile.
+if ( typeof vAPI !== 'object' || vAPI === null ) { return; }
 
-/******************************************************************************/
-
-var onMaybeAbpLinkClicked = function(ev) {
-    if ( ev.button !== 0 ) {
+const onMaybeSubscriptionLinkClicked = function(target) {
+    if ( vAPI instanceof Object === false ) {
+        document.removeEventListener('click', onMaybeSubscriptionLinkClicked);
         return;
     }
-    // This addresses https://github.com/easylist/EasyListHebrew/issues/89
-    // Also, as per feedback to original fix:
-    // https://github.com/gorhill/uBlock/commit/99a3d9631047d33dc7a454296ab3dd0a1e91d6f1
-    var target = ev.target;
-    if (
-        ev.isTrusted === false ||
-        target instanceof HTMLAnchorElement === false
-    ) {
-        return;
-    }
-    var href = target.href || '';
-    if ( href === '' ) {
-        return;
-    }
-    var matches = /^abp:\/*subscribe\/*\?location=([^&]+).*title=([^&]+)/.exec(href);
-    if ( matches === null ) {
-        matches = /^https?:\/\/.*?[&?]location=([^&]+).*?&title=([^&]+)/.exec(href);
-        if ( matches === null ) { return; }
-    }
 
-    var location = decodeURIComponent(matches[1]);
-    var title = decodeURIComponent(matches[2]);
-    var messaging = vAPI.messaging;
-
-    ev.stopPropagation();
-    ev.preventDefault();
-
-    var onListsSelectionDone = function() {
-        messaging.send('scriptlets', { what: 'reloadAllFilters' });
-    };
-
-    var onSubscriberDataReady = function(details) {
-        var confirmStr = details.confirmStr
-                            .replace('{{url}}', location)
-                            .replace('{{title}}', title);
-        if ( !window.confirm(confirmStr) ) { return; }
-        messaging.send(
-            'scriptlets',
-            {
-                what: 'applyFilterListSelection',
-                toImport: location
-            },
-            onListsSelectionDone
+    try {
+        // https://github.com/uBlockOrigin/uBlock-issues/issues/763#issuecomment-691696716
+        //   Remove replacement patch if/when filterlists.com fixes encoded '&'.
+        const subscribeURL = new URL(
+            target.href.replace('&amp;title=', '&title=')
         );
-    };
-
-    messaging.send(
-        'scriptlets',
-        { what: 'subscriberData' },
-        onSubscriberDataReady
-    );
+        if (
+            /^(abp|ubo):$/.test(subscribeURL.protocol) === false &&
+            subscribeURL.hostname !== 'subscribe.adblockplus.org'
+        ) {
+            return;
+        }
+        const location = subscribeURL.searchParams.get('location') || '';
+        const title = subscribeURL.searchParams.get('title') || '';
+        if ( location === '' || title === '' ) { return true; }
+        // https://github.com/uBlockOrigin/uBlock-issues/issues/1797
+        if ( /^(file|https?):\/\//.test(location) === false ) { return true; }
+        vAPI.messaging.send('scriptlets', {
+            what: 'subscribeTo',
+            location,
+            title,
+        });
+        return true;
+    } catch {
+    }
 };
 
-/******************************************************************************/
+// https://github.com/easylist/EasyListHebrew/issues/89
+//   Ensure trusted events only.
 
-// Only if at least one subscribe link exists on the page.
-
-setTimeout(function() {
-    if (
-        document.querySelector('link[rel="canonical"][href="https://filterlists.com/"]') !== null ||
-        document.querySelector('a[href^="abp:"],a[href^="https://subscribe.adblockplus.org/?"]') !== null
-    ) {
-        document.addEventListener('click', onMaybeAbpLinkClicked);
+document.addEventListener('click', ev => {
+    if ( ev.button !== 0 || ev.isTrusted === false ) { return; }
+    const target = ev.target.closest('a');
+    if ( target instanceof HTMLAnchorElement === false ) { return; }
+    if ( onMaybeSubscriptionLinkClicked(target) === true ) {
+        ev.stopPropagation();
+        ev.preventDefault();
     }
-}, 997);
+});
 
 /******************************************************************************/
 
+// <<<<< end of local scope
 })();
 
-/******************************************************************************/
+
+
+
+
+
+
+
+/*******************************************************************************
+
+    DO NOT:
+    - Remove the following code
+    - Add code beyond the following code
+    Reason:
+    - https://github.com/gorhill/uBlock/pull/3721
+    - uBO never uses the return value from injected content scripts
+
+**/
+
+void 0;

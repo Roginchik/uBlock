@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    uBlock Origin - a browser extension to block requests.
-    Copyright (C) 2014-2016 Raymond Hill
+    uBlock Origin - a comprehensive, efficient content blocker
+    Copyright (C) 2014-2018 Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,176 +19,221 @@
     Home: https://github.com/gorhill/uBlock
 */
 
-/* global uDom, uBlockDashboard */
+/* global CodeMirror, uBlockDashboard */
+
+import { dom, qs$ } from './dom.js';
+import { TrustedSiteParser } from './trusted-sites.js';
+import { i18n$ } from './i18n.js';
 
 /******************************************************************************/
 
-(function() {
+const reComment = /^\s*#\s*/;
 
-'use strict';
-
-/******************************************************************************/
-
-var messaging = vAPI.messaging,
-    cachedWhitelist = '';
-
-/******************************************************************************/
-
-var getTextareaNode = function() {
-    var me = getTextareaNode,
-        node = me.theNode;
-    if ( node === undefined ) {
-        node = me.theNode = uDom.nodeFromSelector('#whitelist textarea');
-    }
-    return node;
-};
-
-var setErrorNodeHorizontalOffset = function(px) {
-    var me = setErrorNodeHorizontalOffset,
-        offset = me.theOffset || 0;
-    if ( px === offset ) { return; }
-    var node = me.theNode;
-    if ( node === undefined ) {
-        node = me.theNode = uDom.nodeFromSelector('#whitelist textarea + div');
-    }
-    node.style.right = px + 'px';
-    me.theOffset = px;
-};
+function directiveFromLine(line) {
+    const match = reComment.exec(line);
+    return match === null
+        ? line.trim()
+        : line.slice(match.index + match[0].length).trim();
+}
 
 /******************************************************************************/
 
-var whitelistChanged = (function() {
-    var changedWhitelist, changed, timer;
+CodeMirror.defineMode("ubo-whitelist-directives", function() {
+    const reRegex = /^\/.+\/$/;
 
-    var updateUI = function(good) {
-        uDom.nodeFromId('whitelistApply').disabled = changed || !good;
-        uDom.nodeFromId('whitelistRevert').disabled = changed;
-        uDom.nodeFromId('whitelist').classList.toggle('invalid', !good);
+    return {
+        token: function token(stream) {
+            const line = stream.string.trim();
+            stream.skipToEnd();
+            if ( reComment.test(line) ) { return 'comment'; }
+            if ( line.indexOf('/') === -1 ) {
+                if ( TrustedSiteParser.isBadHostname(line) ) { return 'error'; }
+                if ( whitelistDefaultSet.has(line.trim()) ) { return 'keyword'; }
+                return null;
+            }
+            if ( reRegex.test(line) ) {
+                try { new RegExp(line.slice(1, -1)); }
+                catch { return 'error'; }
+                return null;
+            }
+            if ( TrustedSiteParser.parseDirective(line) === undefined ) { return 'error'; }
+            if ( whitelistDefaultSet.has(line.trim()) ) { return 'keyword'; }
+            return null;
+        }
     };
+});
 
-    var validate = function() {
-        timer = undefined;
-        messaging.send(
-            'dashboard',
-            { what: 'validateWhitelistString', raw: changedWhitelist },
-            updateUI
+let whitelistDefaultSet = new Set();
+
+/******************************************************************************/
+
+const messaging = vAPI.messaging;
+const noopFunc = function(){};
+
+let cachedWhitelist = '';
+
+const cmEditor = new CodeMirror(qs$('#whitelist'), {
+    autofocus: true,
+    lineNumbers: true,
+    lineWrapping: true,
+    styleActiveLine: true,
+});
+
+uBlockDashboard.patchCodeMirrorEditor(cmEditor);
+
+/******************************************************************************/
+
+function getEditorText() {
+    const text = cmEditor.getValue().trimEnd();
+    return text === '' ? text : `${text}\n`;
+}
+
+function setEditorText(text) {
+    cmEditor.setValue(`${text.trimEnd()}\n`);
+}
+
+/******************************************************************************/
+
+function whitelistChanged() {
+    const whitelistElem = qs$('#whitelist');
+    const bad = qs$(whitelistElem, '.cm-error') !== null;
+    const changedWhitelist = getEditorText().trim();
+    const changed = changedWhitelist !== cachedWhitelist;
+    qs$('#whitelistApply').disabled = !changed || bad;
+    qs$('#whitelistRevert').disabled = !changed;
+    CodeMirror.commands.save = changed && !bad ? applyChanges : noopFunc;
+}
+
+cmEditor.on('changes', whitelistChanged);
+
+/******************************************************************************/
+
+async function renderWhitelist(first = false) {
+    const details = await messaging.send('dashboard', {
+        what: 'getWhitelist',
+    });
+    if ( first ) {
+        whitelistDefaultSet = new Set(details.whitelistDefault);
+    }
+    const toAdd = new Set(whitelistDefaultSet);
+    for ( const line of details.whitelist ) {
+        const directive = directiveFromLine(line);
+        if ( whitelistDefaultSet.has(directive) === false ) { continue; }
+        toAdd.delete(directive);
+        if ( toAdd.size === 0 ) { break; }
+    }
+    if ( toAdd.size !== 0 ) {
+        details.whitelist.push(...Array.from(toAdd).map(a => `# ${a}`));
+    }
+    details.whitelist.sort((a, b) => {
+        const ad = directiveFromLine(a);
+        const bd = directiveFromLine(b);
+        const abuiltin = whitelistDefaultSet.has(ad);
+        if ( abuiltin !== whitelistDefaultSet.has(bd) ) {
+            return abuiltin ? -1 : 1;
+        }
+        return ad.localeCompare(bd);
+    });
+    const whitelistStr = details.whitelist.join('\n').trim();
+    cachedWhitelist = whitelistStr;
+    setEditorText(whitelistStr);
+    if ( first ) {
+        cmEditor.clearHistory();
+    }
+}
+
+/******************************************************************************/
+
+function handleImportFilePicker() {
+    const file = this.files[0];
+    if ( file === undefined || file.name === '' ) { return; }
+    if ( file.type.indexOf('text') !== 0 ) { return; }
+    const fr = new FileReader();
+    fr.onload = ev => {
+        if ( ev.type !== 'load' ) { return; }
+        const content = uBlockDashboard.mergeNewLines(
+            getEditorText().trim(),
+            fr.result.trim()
         );
+        setEditorText(content);
     };
-
-    return function() {
-        changedWhitelist = getTextareaNode().value.trim();
-        changed = changedWhitelist === cachedWhitelist;
-        if ( timer !== undefined ) { clearTimeout(timer); }
-        timer = vAPI.setTimeout(validate, 251);
-        var textarea = getTextareaNode();
-        setErrorNodeHorizontalOffset(textarea.offsetWidth - textarea.clientWidth);
-    };
-})();
-
-/******************************************************************************/
-
-var renderWhitelist = function() {
-    var onRead = function(whitelist) {
-        cachedWhitelist = whitelist.trim();
-        getTextareaNode().value = cachedWhitelist + '\n';
-        whitelistChanged();
-    };
-    messaging.send('dashboard', { what: 'getWhitelist' }, onRead);
-};
-
-/******************************************************************************/
-
-var handleImportFilePicker = function() {
-    var fileReaderOnLoadHandler = function() {
-        var textarea = getTextareaNode();
-        textarea.value = [textarea.value.trim(), this.result.trim()].join('\n').trim();
-        whitelistChanged();
-    };
-    var file = this.files[0];
-    if ( file === undefined || file.name === '' ) {
-        return;
-    }
-    if ( file.type.indexOf('text') !== 0 ) {
-        return;
-    }
-    var fr = new FileReader();
-    fr.onload = fileReaderOnLoadHandler;
     fr.readAsText(file);
-};
+}
 
 /******************************************************************************/
 
-var startImportFilePicker = function() {
-    var input = document.getElementById('importFilePicker');
+function startImportFilePicker() {
+    const input = qs$('#importFilePicker');
     // Reset to empty string, this will ensure an change event is properly
     // triggered if the user pick a file, even if it is the same as the last
     // one picked.
     input.value = '';
     input.click();
-};
+}
 
 /******************************************************************************/
 
-var exportWhitelistToFile = function() {
-    var val = getTextareaNode().value.trim();
+function exportWhitelistToFile() {
+    const val = getEditorText();
     if ( val === '' ) { return; }
-    var filename = vAPI.i18n('whitelistExportFilename')
-        .replace('{{datetime}}', uBlockDashboard.dateNowToSensibleString())
-        .replace(/ +/g, '_');
+    const filename =
+        i18n$('whitelistExportFilename')
+            .replace('{{datetime}}', uBlockDashboard.dateNowToSensibleString())
+            .replace(/ +/g, '_');
     vAPI.download({
-        'url': 'data:text/plain;charset=utf-8,' + encodeURIComponent(val + '\n'),
+        'url': `data:text/plain;charset=utf-8,${encodeURIComponent(val + '\n')}`,
         'filename': filename
     });
-};
+}
 
 /******************************************************************************/
 
-var applyChanges = function() {
-    cachedWhitelist = getTextareaNode().value.trim();
-    var request = {
+async function applyChanges() {
+    cachedWhitelist = getEditorText().trim();
+    await messaging.send('dashboard', {
         what: 'setWhitelist',
-        whitelist: cachedWhitelist
-    };
-    messaging.send('dashboard', request, renderWhitelist);
-};
+        whitelist: cachedWhitelist,
+    });
+    renderWhitelist();
+}
 
-var revertChanges = function() {
-    getTextareaNode().value = cachedWhitelist + '\n';
-    whitelistChanged();
-};
+function revertChanges() {
+    setEditorText(cachedWhitelist);
+}
 
 /******************************************************************************/
 
-var getCloudData = function() {
-    return getTextareaNode().value;
-};
+function getCloudData() {
+    return getEditorText();
+}
 
-var setCloudData = function(data, append) {
-    if ( typeof data !== 'string' ) {
-        return;
-    }
-    var textarea = getTextareaNode();
+function setCloudData(data, append) {
+    if ( typeof data !== 'string' ) { return; }
     if ( append ) {
-        data = uBlockDashboard.mergeNewLines(textarea.value.trim(), data);
+        data = uBlockDashboard.mergeNewLines(getEditorText().trim(), data);
     }
-    textarea.value = data.trim() + '\n';
-    whitelistChanged();
-};
+    setEditorText(data.trim());
+}
 
 self.cloud.onPush = getCloudData;
 self.cloud.onPull = setCloudData;
 
 /******************************************************************************/
 
-uDom('#importWhitelistFromFile').on('click', startImportFilePicker);
-uDom('#importFilePicker').on('change', handleImportFilePicker);
-uDom('#exportWhitelistToFile').on('click', exportWhitelistToFile);
-uDom('#whitelist textarea').on('input', whitelistChanged);
-uDom('#whitelistApply').on('click', applyChanges);
-uDom('#whitelistRevert').on('click', revertChanges);
+self.wikilink = 'https://github.com/gorhill/uBlock/wiki/Dashboard:-Trusted-sites';
 
-renderWhitelist();
+self.hasUnsavedData = function() {
+    return getEditorText().trim() !== cachedWhitelist;
+};
 
 /******************************************************************************/
 
-})();
+dom.on('#importWhitelistFromFile', 'click', startImportFilePicker);
+dom.on('#importFilePicker', 'change', handleImportFilePicker);
+dom.on('#exportWhitelistToFile', 'click', exportWhitelistToFile);
+dom.on('#whitelistApply', 'click', ( ) => { applyChanges(); });
+dom.on('#whitelistRevert', 'click', revertChanges);
+
+renderWhitelist(true);
+
+/******************************************************************************/

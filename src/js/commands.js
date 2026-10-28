@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    uBlock Origin - a browser extension to block requests.
-    Copyright (C) 2017 Raymond Hill
+    uBlock Origin - a comprehensive, efficient content blocker
+    Copyright (C) 2017-present Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,42 +19,169 @@
     Home: https://github.com/gorhill/uBlock
 */
 
+import { hostnameFromURI } from './uri-utils.js';
+import µb from './background.js';
+
 /******************************************************************************/
 
-'use strict';
+(( ) => {
 
-/******************************************************************************/
+// *****************************************************************************
+// start of local namespace
 
-(function() {
-    if ( vAPI.commands === undefined ) { return; }
+if ( vAPI.commands instanceof Object === false ) { return; }
 
-    vAPI.commands.onCommand.addListener(function(command) {
-        var µb = µBlock;
+const relaxBlockingMode = (( ) => {
+    const reloadTimers = new Map();
 
-        switch ( command ) {
-        case 'launch-element-zapper':
-        case 'launch-element-picker':
-            vAPI.tabs.get(null, function(tab) {
-                if ( tab instanceof Object === false ) {
-                    return;
-                }
-                µb.mouseX = µb.mouseY = -1;
-                µb.elementPickerExec(tab.id, undefined, command === 'launch-element-zapper');
-            });
-            break;
-        case 'launch-logger':
-            vAPI.tabs.get(null, function(tab) {
-                µb.openNewTab({
-                    url: 'logger-ui.html#tab_' + tab.id,
-                    select: true,
-                    index: -1
-                });
-            });
-            break;
-        default:
-            break;
+    return function(tab) {
+        if ( tab instanceof Object === false || tab.id <= 0 ) { return; }
+
+        const normalURL = µb.normalizeTabURL(tab.id, tab.url);
+
+        if ( µb.isTrustedSite(normalURL) ) { return; }
+
+        const hn = hostnameFromURI(normalURL);
+        const curProfileBits = µb.blockingModeFromHostname(hn);
+        let newProfileBits;
+        for ( const profile of µb.liveBlockingProfiles ) {
+            if ( (curProfileBits & profile.bits & ~1) !== curProfileBits ) {
+                newProfileBits = profile.bits;
+                break;
+            }
         }
-    });
+
+        // TODO: Reset to original blocking profile?
+        if ( newProfileBits === undefined ) { return; }
+
+        const noReload = (newProfileBits & 0b00000001) === 0;
+
+        if (
+            (curProfileBits & 0b00000010) !== 0 &&
+            (newProfileBits & 0b00000010) === 0
+        ) {
+            µb.toggleHostnameSwitch({
+                name: 'no-scripting',
+                hostname: hn,
+                state: false,
+            });
+        }
+        if ( µb.userSettings.advancedUserEnabled ) {
+            if (
+                (curProfileBits & 0b00000100) !== 0 &&
+                (newProfileBits & 0b00000100) === 0
+            ) {
+                µb.toggleFirewallRule({
+                    tabId: noReload ? tab.id : undefined,
+                    srcHostname: hn,
+                    desHostname: '*',
+                    requestType: '3p',
+                    action: 3,
+                });
+            }
+            if (
+                (curProfileBits & 0b00001000) !== 0 &&
+                (newProfileBits & 0b00001000) === 0
+            ) {
+                µb.toggleFirewallRule({
+                    srcHostname: hn,
+                    desHostname: '*',
+                    requestType: '3p-script',
+                    action: 3,
+                });
+            }
+            if (
+                (curProfileBits & 0b00010000) !== 0 &&
+                (newProfileBits & 0b00010000) === 0
+            ) {
+                µb.toggleFirewallRule({
+                    srcHostname: hn,
+                    desHostname: '*',
+                    requestType: '3p-frame',
+                    action: 3,
+                });
+            }
+        }
+
+        // Reload the target tab?
+        if ( noReload ) { return; }
+
+        // Reload: use a timer to coalesce bursts of reload commands.
+        const timer = reloadTimers.get(tab.id) || (( ) => {
+            const t = vAPI.defer.create(tabId => {
+                reloadTimers.delete(tabId);
+                vAPI.tabs.reload(tabId);
+            });
+            reloadTimers.set(tab.id, t);
+            return t;
+        })();
+        timer.offon(547, tab.id);
+    };
+})();
+
+vAPI.commands.onCommand.addListener(async command => {
+    // Generic commands
+    if ( command === 'open-dashboard' ) {
+        µb.openNewTab({
+            url: 'dashboard.html',
+            select: true,
+            index: -1,
+        });
+        return;
+    }
+    // Tab-specific commands
+    const tab = await vAPI.tabs.getCurrent();
+    if ( tab instanceof Object === false ) { return; }
+
+    switch ( command ) {
+    case 'launch-element-picker':
+        if ( µb.userFiltersAreEnabled() === false ) { break; }
+        /* fall through */
+    case 'launch-element-zapper': {
+        µb.epickerArgs.mouse = false;
+        µb.elementPickerExec(
+            tab.id,
+            0,
+            undefined,
+            command === 'launch-element-zapper'
+        );
+        break;
+    }
+    case 'launch-logger': {
+        const hash = tab.url.startsWith(vAPI.getURL(''))
+            ? ''
+            : `#_+${tab.id}`;
+        µb.openNewTab({
+            url: `logger-ui.html${hash}`,
+            select: true,
+            index: -1,
+        });
+        break;
+    }
+    case 'relax-blocking-mode':
+        relaxBlockingMode(tab);
+        break;
+    case 'toggle-cosmetic-filtering':
+        µb.toggleHostnameSwitch({
+            name: 'no-cosmetic-filtering',
+            hostname: hostnameFromURI(µb.normalizeTabURL(tab.id, tab.url)),
+        });
+        break;
+    case 'toggle-javascript':
+        µb.toggleHostnameSwitch({
+            name: 'no-scripting',
+            hostname: hostnameFromURI(µb.normalizeTabURL(tab.id, tab.url)),
+        });
+        vAPI.tabs.reload(tab.id);
+        break;
+    default:
+        break;
+    }
+});
+
+// end of local namespace
+// *****************************************************************************
+
 })();
 
 /******************************************************************************/
